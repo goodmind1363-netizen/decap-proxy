@@ -1,4 +1,3 @@
-
 import { OAuthClient } from './oauth';
 
 interface Env {

@@ -10,6 +10,7 @@ interface Env {
 function randomHex(bytes: number): string {
   const buf = new Uint8Array(bytes);
   crypto.getRandomValues(buf);
+
   return Array.from(buf)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
@@ -32,7 +33,8 @@ const handleAuth = async (url: URL, env: Env) => {
     return new Response('Invalid provider', { status: 400 });
   }
 
-  const repoIsPrivate = env.GITHUB_REPO_PRIVATE !== undefined &&
+  const repoIsPrivate =
+    env.GITHUB_REPO_PRIVATE !== undefined &&
     env.GITHUB_REPO_PRIVATE !== '0';
 
   const repoScope = repoIsPrivate
@@ -52,28 +54,30 @@ const handleAuth = async (url: URL, env: Env) => {
 
 const callbackScriptResponse = (status: string, token: string) => {
   return new Response(
-    `
-<!doctype html>
+    `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>ORVIKIT Authorization</title>
-  <script>
-    window.addEventListener("message", function receiveMessage() {
-      window.opener.postMessage(
-        'authorization:github:${status}:${JSON.stringify({ token })}',
-        '*'
-      );
-      window.removeEventListener("message", receiveMessage);
-    });
-    window.opener.postMessage("authorizing:github", "*");
-  </script>
 </head>
 <body>
   <p>Authorizing Decap...</p>
+  <script>
+    (function () {
+      var receiveMessage = function () {
+        window.opener.postMessage(
+          'authorization:github:${status}:${JSON.stringify({ token })}',
+          '*'
+        );
+        window.removeEventListener('message', receiveMessage, false);
+      };
+
+      window.addEventListener('message', receiveMessage, false);
+      window.opener.postMessage('authorizing:github', '*');
+    })();
+  </script>
 </body>
-</html>
-`,
+</html>`,
     {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',

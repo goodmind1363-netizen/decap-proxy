@@ -1,3 +1,4 @@
+
 import { OAuthClient } from './oauth';
 
 interface Env {
@@ -15,7 +16,11 @@ function randomHex(bytes: number): string {
     .join('');
 }
 
-const createOAuth = (env: Env) => {
+function createOAuth(env: Env) {
+  if (!env.GITHUB_OAUTH_ID || !env.GITHUB_OAUTH_SECRET) {
+    throw new Error('GitHub OAuth credentials are missing.');
+  }
+
   return new OAuthClient({
     id: env.GITHUB_OAUTH_ID,
     secret: env.GITHUB_OAUTH_SECRET,
@@ -25,33 +30,76 @@ const createOAuth = (env: Env) => {
       authorizePath: '/login/oauth/authorize',
     },
   });
-};
+}
 
-const handleAuth = async (url: URL, env: Env) => {
+function errorResponse(message: string, status = 500) {
+  console.error('ORVIKIT OAuth error:', message);
+
+  return new Response(
+    `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>ORVIKIT Authorization Error</title></head>
+<body>
+  <h2>Authorization failed</h2>
+  <p>${message.replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[c] || c))}</p>
+  <p>Please close this window and try again.</p>
+</body>
+</html>`,
+    {
+      status,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    }
+  );
+}
+
+async function handleAuth(url: URL, env: Env) {
   if (url.searchParams.get('provider') !== 'github') {
-    return new Response('Invalid provider', { status: 400 });
+    return errorResponse('Invalid OAuth provider.', 400);
   }
 
-  const repoIsPrivate =
-    env.GITHUB_REPO_PRIVATE !== undefined &&
-    env.GITHUB_REPO_PRIVATE !== '0';
+  const state = randomHex(16);
 
-  const repoScope = repoIsPrivate
+  const repoIsPrivate =
+    env.GITHUB_REPO_PRIVATE === '1' ||
+    env.GITHUB_REPO_PRIVATE === 'true';
+
+  const scope = repoIsPrivate
     ? 'repo,user'
     : 'public_repo,user';
 
-  const oauth2 = createOAuth(env);
+  const oauth = createOAuth(env);
 
-  const authorizationUri = oauth2.authorizeURL({
+  const authorizationUrl = oauth.authorizeURL({
     redirect_uri: `https://${url.hostname}/callback`,
-    scope: repoScope,
-    state: randomHex(4),
+    scope,
+    state,
   });
 
-  return Response.redirect(authorizationUri, 302);
-};
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: authorizationUrl,
+      'Set-Cookie': `oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/callback; Max-Age=600`,
+      'Cache-Control': 'no-store',
+    },
+  });
+}
 
-const callbackScriptResponse = (status: string, token: string) => {
+function callbackScriptResponse(token: string) {
+  const message = JSON.stringify(
+    'authorization:github:success:' +
+    JSON.stringify({ token })
+  );
+
   return new Response(
     `<!doctype html>
 <html>
@@ -63,15 +111,23 @@ const callbackScriptResponse = (status: string, token: string) => {
   <p>Authorizing Decap...</p>
   <script>
     (function () {
-      var receiveMessage = function () {
-        window.opener.postMessage(
-          'authorization:github:${status}:${JSON.stringify({ token })}',
-          '*'
-        );
-        window.removeEventListener('message', receiveMessage, false);
-      };
+      if (!window.opener) {
+        document.body.innerHTML = '<p>Please close this window and try again from ORVIKIT CMS.</p>';
+        return;
+      }
 
-      window.addEventListener('message', receiveMessage, false);
+      var authorizationMessage = ${message};
+
+      window.addEventListener('message', function (event) {
+        if (event.data === 'authorizing:github') {
+          window.opener.postMessage(
+            authorizationMessage,
+            event.origin
+          );
+          window.close();
+        }
+      });
+
       window.opener.postMessage('authorizing:github', '*');
     })();
   </script>
@@ -81,49 +137,79 @@ const callbackScriptResponse = (status: string, token: string) => {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-store',
+        'Set-Cookie': 'oauth_state=; HttpOnly; Secure; SameSite=Lax; Path=/callback; Max-Age=0',
       },
     }
   );
-};
+}
 
-const handleCallback = async (url: URL, env: Env) => {
-  const provider = url.searchParams.get('provider') ?? 'github';
+async function handleCallback(request: Request, url: URL, env: Env) {
+  const params = url.searchParams;
 
-  if (provider !== 'github') {
-    return new Response('Invalid provider', { status: 400 });
+  if (params.get('error')) {
+    return errorResponse(
+      params.get('error_description') ||
+      params.get('error') ||
+      'GitHub authorization was denied.',
+      400
+    );
   }
 
-  const code = url.searchParams.get('code');
+  const code = params.get('code');
+  const returnedState = params.get('state');
 
-  if (!code) {
-    return new Response('Missing code', { status: 400 });
+  if (!code || !returnedState) {
+    return errorResponse('Missing authorization code or state.', 400);
   }
 
-  const oauth2 = createOAuth(env);
+  const cookies = request.headers.get('Cookie') || '';
+  const stateMatch = cookies.match(/(?:^|;\s*)oauth_state=([a-f0-9]+)/);
+  const savedState = stateMatch?.[1];
 
-  const accessToken = await oauth2.getToken({
+  if (!savedState || savedState !== returnedState) {
+    return errorResponse('Invalid OAuth state. Please try again.', 400);
+  }
+
+  const oauth = createOAuth(env);
+
+  const accessToken = await oauth.getToken({
     code,
     redirect_uri: `https://${url.hostname}/callback`,
   });
 
-  return callbackScriptResponse('success', accessToken);
-};
+  if (!accessToken) {
+    return errorResponse('GitHub did not return an access token.');
+  }
+
+  return callbackScriptResponse(accessToken);
+}
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === '/auth') {
-      return handleAuth(url, env);
-    }
+    try {
+      if (url.pathname === '/auth') {
+        return await handleAuth(url, env);
+      }
 
-    if (url.pathname === '/callback') {
-      return handleCallback(url, env);
-    }
+      if (url.pathname === '/callback') {
+        return await handleCallback(request, url, env);
+      }
 
-    return new Response('Hello 👋');
+      if (url.pathname === '/favicon.ico') {
+        return new Response(null, { status: 204 });
+      }
+
+      return new Response('ORVIKIT OAuth Worker is running.', {
+        headers: { 'Cache-Control': 'no-store' },
+      });
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : 'Unknown OAuth error';
+
+      return errorResponse(message);
+    }
   },
 };
